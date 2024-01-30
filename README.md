@@ -8,7 +8,7 @@ source activate pykt
 ```
 
 ```
-cd UniKT
+cd HF-KT
 pip install -e .
 ```
 
@@ -20,18 +20,13 @@ You can download datasets from {https://pykt-toolkit.readthedocs.io/en/latest/da
 ### Preprocess
 ```
 cd examples
-python data_preprocess.py --dataset_name=algebra2005
-python data_preprocess.py --dataset_name=bridge2algebra2006
-python data_preprocess.py --dataset_name=nips_task34
-python data_preprocess.py --dataset_name=peiyou
-python data_preprocess.py --dataset_name=assist2009
-python data_preprocess.py --dataset_name=ednet5w
+python data_preprocess.py --dataset_name=ednet_all
 ```
 
 ## Train & Evaluate
 ### Train
 ```
-python -m torch.distributed.launch --nproc_per_node=1 wandb_gpt4kt_train.py --seq_len=200
+python -m torch.distributed.launch --nproc_per_node=1 wandb_unikt_train.py --seq_len=200
 ```
 
 ## Evaluate
