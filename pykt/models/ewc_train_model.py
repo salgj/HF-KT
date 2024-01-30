@@ -38,8 +38,8 @@ def cal_loss(model, ys, r, rshft, sm, preloss=[]):
     if model_name in ["gpt4kt","unikt"]:
         y = torch.masked_select(ys[0], sm)
         t = torch.masked_select(rshft, sm)
-        print(f"y: {y.shape}")
-        print(f"t: {t.shape}")
+        # print(f"y: {y.shape}")
+        # print(f"t: {t.shape}")
         loss1 = binary_cross_entropy(y.double(), t.double())
 
         if model.module.emb_type.find("predcurc") != -1:
@@ -156,13 +156,15 @@ def sample4cl(curtrain, batch_size, i, c0, max_epoch):
     return simple_size, bn
 
 
-def train_model(
+def ewc_train_model(
     model,
+    previous_loader,
     train_loader,
     valid_loader,
     num_epochs,
     opt,
     ckpt_path,
+    lambda_ewc,
     test_loader=None,
     test_window_loader=None,
     save_model=False,
@@ -172,7 +174,7 @@ def train_model(
     batch_size=None,
     gradient_accumulation_steps=4.0,
     args=None,
-    use_wandb=False
+    use_wandb=False,
 ):
     global local_rank, node_rank
     local_rank = args.local_rank
@@ -186,7 +188,48 @@ def train_model(
 
     simple_size = 0
     cl_bn = 10000
+    # 计算重要度举证
+    params = {n: p for n, p in model.named_parameters() if p.requires_grad}
+    _means = {} # 初始化要把参数限制在的参数域
+    for n, p in params.items():
+        _means[n] = p.data.clone().detach()
+    precision_matrices = {} # 重要度
+    for n, p in params.items():
+        precision_matrices [n] = p.clone().detach().fill(0) # 取zeros_like
+    model.eval()
+    for j, data in enumerate(previous_loader):
+        model.zero_grad()
+        dcur, dgaps = data
+        q, c, r, t = (
+            dcur["qseqs"].to(device),
+            dcur["cseqs"].to(device),
+            dcur["rseqs"].to(device),
+            dcur["tseqs"].to(device),
+        )
+        qshft, cshft, rshft, tshft = (
+            dcur["shft_qseqs"].to(device),
+            dcur["shft_cseqs"].to(device),
+            dcur["shft_rseqs"].to(device),
+            dcur["shft_tseqs"].to(device),
+        )
+    m, sm = dcur["masks"].to(device), dcur["smasks"].to(device)
 
+    ys, preloss = [], []
+    cq = torch.cat((q[:, 0:1], qshft), dim=1)
+    cc = torch.cat((c[:, 0:1], cshft), dim=1)
+    cr = torch.cat((r[:, 0:1], rshft), dim=1)
+    if model.module.emb_type == "qid":
+        y, y2, y3 = model(dcur, train=True)
+    ys = [y[:, 1:], y2, y3]
+    
+    y = torch.masked_select(ys[0], sm)
+    t = torch.masked_select(rshft, sm)
+    loss1 = binary_cross_entropy(y.double(), t.double())
+    loss1.backward()
+    for n, p in model.named_parameters():
+        precision_matrices[n].data += p.grad.data ** 2 / len(previous_loader)  # 计算重要度，以梯度的平方作为重要度
+    
+    model.train()
     for i in range(pretrain_epoch + 1, num_epochs + 1):
         start_time = time.time()
         loss_mean = []
@@ -223,6 +266,11 @@ def train_model(
             else:
                 loss = model_forward(model, data, i)
 
+            for n, p in model.named_parameters():
+                _loss = precision_matrices[n] * (p - _means[n]) ** 2
+                ewc_loss += _loss.sum()
+            # ewc_loss + train_loss
+            loss += lambda_ewc * ewc_loss
             loss = loss / gradient_accumulation_steps
             # print(f"loss:{loss}")
             loss.backward()  # compute gradients

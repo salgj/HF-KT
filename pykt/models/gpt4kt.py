@@ -7,24 +7,71 @@ import torch.nn.functional as F
 from enum import IntEnum
 import numpy as np
 from .utils import transformer_FFN, ut_mask, pos_encode, get_clones
-from torch.nn import Module, Embedding, LSTM, Linear, Dropout, LayerNorm, TransformerEncoder, TransformerEncoderLayer, \
-        MultiLabelMarginLoss, MultiLabelSoftMarginLoss, CrossEntropyLoss, BCELoss, MultiheadAttention
-from torch.nn.functional import one_hot, cross_entropy, multilabel_margin_loss, binary_cross_entropy
-from .que_base_model import QueBaseModel,QueEmb
+from torch.nn import (
+    Module,
+    Embedding,
+    LSTM,
+    Linear,
+    Dropout,
+    LayerNorm,
+    TransformerEncoder,
+    TransformerEncoderLayer,
+    MultiLabelMarginLoss,
+    MultiLabelSoftMarginLoss,
+    CrossEntropyLoss,
+    BCELoss,
+    MultiheadAttention,
+)
+from torch.nn.functional import (
+    one_hot,
+    cross_entropy,
+    multilabel_margin_loss,
+    binary_cross_entropy,
+)
+from .que_base_model import QueBaseModel, QueEmb
 from torch.utils.checkpoint import checkpoint
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class Dim(IntEnum):
     batch = 0
     seq = 1
     feature = 2
 
+
 class GPT4KT(nn.Module):
-    def __init__(self, n_question, n_pid, 
-            d_model, n_blocks, dropout, d_ff=256, 
-            loss1=0.5, loss2=0.5, loss3=0.5, start=50, num_layers=2, nheads=4, seq_len=1024, 
-            kq_same=1, final_fc_dim=512, final_fc_dim2=256, num_attn_heads=8, separate_qa=False, l2=1e-5, emb_type="qid", emb_path="", pretrain_dim=768, cf_weight=0.3, t_weight=0.3, local_rank=1, num_sgap=None, c0=0, max_epoch=0):
+    def __init__(
+        self,
+        n_question,
+        n_pid,
+        d_model,
+        n_blocks,
+        dropout,
+        d_ff=256,
+        loss1=0.5,
+        loss2=0.5,
+        loss3=0.5,
+        start=50,
+        num_layers=2,
+        nheads=4,
+        seq_len=1024,
+        kq_same=1,
+        final_fc_dim=512,
+        final_fc_dim2=256,
+        num_attn_heads=8,
+        separate_qa=False,
+        l2=1e-5,
+        emb_type="qid",
+        emb_path="",
+        pretrain_dim=768,
+        cf_weight=0.3,
+        t_weight=0.3,
+        local_rank=1,
+        num_sgap=None,
+        c0=0,
+        max_epoch=0,
+    ):
         super().__init__()
         """
         Input:
@@ -48,98 +95,94 @@ class GPT4KT(nn.Module):
         self.cf_weight = cf_weight
         self.t_weight = t_weight
         self.num_sgap = num_sgap
-        
+
         self.embed_l = d_model
 
-        self.que_emb = nn.Embedding(self.n_pid+1, self.embed_l)#question embeding
-        self.concept_emb = nn.Parameter(torch.randn(self.n_question+1, self.embed_l).to(device), requires_grad=True)#concept embeding
+        self.que_emb = nn.Embedding(self.n_pid + 1, self.embed_l)  # question embeding
+        self.concept_emb = nn.Parameter(
+            torch.randn(self.n_question + 1, self.embed_l).to(device),
+            requires_grad=True,
+        )  # concept embeding
+        # self.dataset_emb = nn.Embedding(20, self.embed_l)  # dataset_id embedding
 
         self.qa_embed = nn.Embedding(2, self.embed_l)
-        
-        if self.emb_type.find("pt") != -1:
-            self.time_emb = nn.Embedding(self.num_sgap+1, self.embed_l)
+
         # Architecture Object. It contains stack of attention block
-        self.model = Architecture(n_question=n_question, n_blocks=n_blocks, n_heads=num_attn_heads, dropout=dropout,
-                                    d_model=d_model, d_feature=d_model / num_attn_heads, d_ff=d_ff,  kq_same=self.kq_same, model_type=self.model_type, seq_len=seq_len)
+        self.model = Architecture(
+            n_question=n_question,
+            n_blocks=n_blocks,
+            n_heads=num_attn_heads,
+            dropout=dropout,
+            d_model=d_model,
+            d_feature=d_model / num_attn_heads,
+            d_ff=d_ff,
+            kq_same=self.kq_same,
+            model_type=self.model_type,
+            seq_len=seq_len,
+        )
 
         self.out = nn.Sequential(
-            nn.Linear(d_model + self.embed_l,
-                      final_fc_dim), nn.ReLU(), nn.Dropout(self.dropout),
-            nn.Linear(final_fc_dim, final_fc_dim2), nn.ReLU(
-            ), nn.Dropout(self.dropout),
-            nn.Linear(final_fc_dim2, 1)
+            nn.Linear(d_model + self.embed_l, final_fc_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(final_fc_dim, final_fc_dim2),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(final_fc_dim2, 1),
         )
-        if emb_type.find("predc") != -1:
-            self.qclasifier = nn.Sequential(
-                nn.Linear(d_model + self.embed_l,
-                        final_fc_dim), nn.ReLU(), nn.Dropout(self.dropout),
-                nn.Linear(final_fc_dim, final_fc_dim2), nn.ReLU(
-                ), nn.Dropout(self.dropout),
-                nn.Linear(final_fc_dim2, self.n_pid)
-            )
-            
-        if emb_type.find("pt") != -1: 
-            self.t_out = nn.Sequential(
-                nn.Linear(d_model + self.embed_l,
-                        final_fc_dim), nn.ReLU(), nn.Dropout(self.dropout),
-                nn.Linear(final_fc_dim, final_fc_dim2), nn.ReLU(
-                ), nn.Dropout(self.dropout),
-                nn.Linear(final_fc_dim2, 1)
-            )
 
         self.reset()
 
     def reset(self):
         for p in self.parameters():
-            if p.size(0) == self.n_pid+1 and self.n_pid > 0:
-                torch.nn.init.constant_(p, 0.)
+            if p.size(0) == self.n_pid + 1 and self.n_pid > 0:
+                torch.nn.init.constant_(p, 0.0)
 
-    def get_avg_skill_emb(self,c):
+    def get_avg_skill_emb(self, c):
         # add zero for padding
         concept_emb_cat = torch.cat(
-            [torch.zeros(1, self.embed_l).to(device), 
-            self.concept_emb], dim=0)
+            [torch.zeros(1, self.embed_l).to(device), self.concept_emb], dim=0
+        )
         # shift c
 
-        related_concepts = (c+1).long()
-        #[batch_size, seq_len, emb_dim]
-        concept_emb_sum = concept_emb_cat[related_concepts, :].sum(
-            axis=-2)
+        related_concepts = (c + 1).long()
+        # [batch_size, seq_len, emb_dim]
+        concept_emb_sum = concept_emb_cat[related_concepts, :].sum(axis=-2)
 
-        #[batch_size, seq_len,1]
-        concept_num = torch.where(related_concepts != 0, 1, 0).sum(
-            axis=-1).unsqueeze(-1)
+        # [batch_size, seq_len,1]
+        concept_num = (
+            torch.where(related_concepts != 0, 1, 0).sum(axis=-1).unsqueeze(-1)
+        )
         concept_num = torch.where(concept_num == 0, 1, concept_num)
-        concept_avg = (concept_emb_sum / concept_num)
+        concept_avg = concept_emb_sum / concept_num
         return concept_avg
 
     def forward(self, dcur, qtest=False, train=False, dgaps=None):
-        q, c, r = dcur["qseqs"].long().to(device), dcur["cseqs"].long().to(device), dcur["rseqs"].long().to(device)
-        qshft, cshft, rshft = dcur["shft_qseqs"].long().to(device), dcur["shft_cseqs"].long().to(device), dcur["shft_rseqs"].long().to(device)
-        pid_data = torch.cat((q[:,0:1], qshft), dim=1)
-        q_data = torch.cat((c[:,0:1], cshft), dim=1)
-        target = torch.cat((r[:,0:1], rshft), dim=1)
+        q, c, r = (
+            dcur["qseqs"].long().to(device),
+            dcur["cseqs"].long().to(device),
+            dcur["rseqs"].long().to(device),
+        )
+        qshft, cshft, rshft = (
+            dcur["shft_qseqs"].long().to(device),
+            dcur["shft_cseqs"].long().to(device),
+            dcur["shft_rseqs"].long().to(device),
+        )
+        # print(f"q:{q.shape}")
+        # dataset_id = dcur["dataset_id"].long().to(device)
+        pid_data = torch.cat((q[:, 0:1], qshft), dim=1)
+        q_data = torch.cat((c[:, 0:1], cshft), dim=1)
+        target = torch.cat((r[:, 0:1], rshft), dim=1)
         # print(f"pid_data:{pid_data}")
-        emb_q = self.que_emb(pid_data)#[batch,max_len-1,emb_size]
-        emb_c = self.get_avg_skill_emb(q_data)#[batch,max_len-1,emb_size]
+        emb_q = self.que_emb(pid_data)  # [batch,max_len-1,emb_size]
+        emb_c = self.get_avg_skill_emb(q_data)  # [batch,max_len-1,emb_size]
         q_embed_data = emb_q + emb_c
-        
-        # # Batch First
-        # if pid_data.size(1) == 0:
-        #     pid_data,q_data = q_data, pid_data
-        # _, emb_qca, emb_qc, emb_q, emb_c = self.que_emb(pid_data, q_data, target)
-        # if q_data.size(1) == 0:
-        #     q_embed_data = emb_q
-        # else:
-        #     q_embed_data = emb_q + emb_c
-        # # print(f"emb_q:{emb_q.shape}")
-        if self.emb_type.find("pt") != -1:
-            sg, sgshft = dgaps["sgaps"].long(), dgaps["shft_sgaps"].long()
-            s_gaps = torch.cat((sg[:, 0:1], sgshft), dim=1)
-            emb_t = self.time_emb(s_gaps)
-            q_embed_data += emb_t
+
+        # dataset_embed_data = self.dataset_emb(dataset_id).unsqueeze(1)
         qa_embed_data = self.qa_embed(target)
-        qa_embed_data = q_embed_data + qa_embed_data
+        # print(f"qa_embed_data:{qa_embed_data.shape}")
+        # print(f"dataset_emb_data:{dataset_embed_data.shape}")
+        qa_embed_data = q_embed_data + qa_embed_data  # + dataset_embed_data
 
         # BS.seqlen,d_model
         # Pass to the decoder
@@ -152,34 +195,7 @@ class GPT4KT(nn.Module):
         preds = m(output)
 
         cl_losses = 0
-        if self.emb_type.find("predc") != -1 and train:
-            sm = dcur["smasks"].long()
-            start = 0
-            cpreds = self.qclasifier(concat_q[:,start:,:])
-            # print(f"cpreds:{cpreds.shape}")
-            flag = sm[:,start:]==1
-            # print(f"flag:{flag.shape}")
-            # print(f"cpreds:{cpreds[:,:-1,:][flag].shape}")
-            # print(f"qtag:{q[:,start:][flag].shape}")
-            cl_loss = self.ce_loss(cpreds[:,:-1,:][flag], q[:,start:][flag])
-            cl_losses += self.cf_weight * cl_loss
-        
-        if self.emb_type.find("pt") != -1 and train:
-            t_label= dgaps["shft_pretlabel"].double()
-            t_combined = torch.cat((d_output, emb_t), -1)
-            t_output = self.t_out(t_combined).squeeze(-1)
-            t_pred = m(t_output)[:,1:]
-            # print(f"t_pred:{t_pred}")
-            sm = dcur["smasks"]
-            ty = torch.masked_select(t_pred, sm)
-            # print(f"min_y:{torch.min(ty)}")
-            tt = torch.masked_select(t_label, sm)
-            # print(f"min_t:{torch.min(tt)}")
-            t_loss = binary_cross_entropy(ty.double(), tt.double())
-            # t_loss = mse_loss(ty.double(), tt.double())
-            # print(f"t_loss:{t_loss}")
-            cl_losses += self.t_weight * t_loss
-            
+
         if train:
             if self.emb_type == "qid":
                 return preds, y2, y3
@@ -191,9 +207,21 @@ class GPT4KT(nn.Module):
             else:
                 return preds
 
+
 class Architecture(nn.Module):
-    def __init__(self, n_question,  n_blocks, d_model, d_feature,
-                 d_ff, n_heads, dropout, kq_same, model_type, seq_len):
+    def __init__(
+        self,
+        n_question,
+        n_blocks,
+        d_model,
+        d_feature,
+        d_ff,
+        n_heads,
+        dropout,
+        kq_same,
+        model_type,
+        seq_len,
+    ):
         super().__init__()
         """
             n_block : number of stacked blocks in the attention
@@ -204,13 +232,23 @@ class Architecture(nn.Module):
         self.d_model = d_model
         self.model_type = model_type
 
-        if model_type in {'gpt4kt'}:
-            self.blocks_2 = nn.ModuleList([
-                TransformerLayer(d_model=d_model, d_feature=d_model // n_heads,
-                                 d_ff=d_ff, dropout=dropout, n_heads=n_heads, kq_same=kq_same)
-                for _ in range(n_blocks)
-            ])
-        self.position_emb = CosinePositionalEmbedding(d_model=self.d_model, max_len=seq_len)
+        if model_type in {"gpt4kt"}:
+            self.blocks_2 = nn.ModuleList(
+                [
+                    TransformerLayer(
+                        d_model=d_model,
+                        d_feature=d_model // n_heads,
+                        d_ff=d_ff,
+                        dropout=dropout,
+                        n_heads=n_heads,
+                        kq_same=kq_same,
+                    )
+                    for _ in range(n_blocks)
+                ]
+            )
+        self.position_emb = CosinePositionalEmbedding(
+            d_model=self.d_model, max_len=seq_len
+        )
 
     def forward(self, inputs):
         # target shape  bs, seqlen
@@ -230,14 +268,14 @@ class Architecture(nn.Module):
         x = q_pos_embed
 
         # encoder
-        
+
         for block in self.blocks_2:
             # x.requires_grad_(True)
             # y.requires_grad_(True)
             # def run_block(mask, query, key, values, apply_pos):
             #     return block(mask, query, key, values, apply_pos)
             # x = checkpoint(run_block, mask, x, x, y, apply_pos)
-            
+
             x = checkpoint(block, x, x, y)
             # x = block(mask=0, query=x, key=x, values=y, apply_pos=True) # True: +FFN+残差+laynorm 非第一层与0~t-1的的q的attention, 对应图中Knowledge Retriever
             # mask=0，不能看到当前的response, 在Knowledge Retrever的value全为0，因此，实现了第一题只有question信息，无qa信息的目的
@@ -245,9 +283,9 @@ class Architecture(nn.Module):
             # x = input_data[1]
         return x
 
+
 class TransformerLayer(nn.Module):
-    def __init__(self, d_model, d_feature,
-                 d_ff, n_heads, dropout,  kq_same):
+    def __init__(self, d_model, d_feature, d_ff, n_heads, dropout, kq_same):
         super().__init__()
         """
             This is a Basic Block of Transformer paper. It containts one Multi-head attention object. Followed by layer norm and postion wise feedforward net and dropout layer.
@@ -255,7 +293,8 @@ class TransformerLayer(nn.Module):
         kq_same = kq_same == 1
         # Multi-Head Attention Block
         self.masked_attn_head = MultiHeadAttention(
-            d_model, d_feature, n_heads, dropout, kq_same=kq_same)
+            d_model, d_feature, n_heads, dropout, kq_same=kq_same
+        )
 
         # Two layer norm layer and two droput layer
         self.layer_norm1 = nn.LayerNorm(d_model)
@@ -283,27 +322,29 @@ class TransformerLayer(nn.Module):
 
         """
         mask = 0
-        apply_pos=True
+        apply_pos = True
         seqlen, batch_size = query.size(1), query.size(0)
-        nopeek_mask = np.triu(
-            np.ones((1, 1, seqlen, seqlen)), k=mask).astype('uint8')
+        nopeek_mask = np.triu(np.ones((1, 1, seqlen, seqlen)), k=mask).astype("uint8")
         src_mask = (torch.from_numpy(nopeek_mask) == 0).to(device)
         if mask == 0:  # If 0, zero-padding is needed.
             # Calls block.masked_attn_head.forward() method
             query2 = self.masked_attn_head(
-                query, key, values, mask=src_mask, zero_pad=True) # 只能看到之前的信息，当前的信息也看不到，此时会把第一行score全置0，表示第一道题看不到历史的interaction信息，第一题attn之后，对应value全0
+                query, key, values, mask=src_mask, zero_pad=True
+            )  # 只能看到之前的信息，当前的信息也看不到，此时会把第一行score全置0，表示第一道题看不到历史的interaction信息，第一题attn之后，对应value全0
         else:
             # Calls block.masked_attn_head.forward() method
             query2 = self.masked_attn_head(
-                query, key, values, mask=src_mask, zero_pad=False)
+                query, key, values, mask=src_mask, zero_pad=False
+            )
 
-        query = query + self.dropout1((query2)) # 残差1
-        query = self.layer_norm1(query) # layer norm
+        query = query + self.dropout1((query2))  # 残差1
+        query = self.layer_norm1(query)  # layer norm
         if apply_pos:
-            query2 = self.linear2(self.dropout( # FFN
-                self.activation(self.linear1(query))))
-            query = query + self.dropout2((query2)) # 残差
-            query = self.layer_norm2(query) # lay norm
+            query2 = self.linear2(
+                self.dropout(self.activation(self.linear1(query)))  # FFN
+            )
+            query = query + self.dropout2((query2))  # 残差
+            query = self.layer_norm2(query)  # lay norm
         return query
 
 
@@ -335,14 +376,13 @@ class MultiHeadAttention(nn.Module):
             xavier_uniform_(self.q_linear.weight)
 
         if self.proj_bias:
-            constant_(self.k_linear.bias, 0.)
-            constant_(self.v_linear.bias, 0.)
+            constant_(self.k_linear.bias, 0.0)
+            constant_(self.v_linear.bias, 0.0)
             if self.kq_same is False:
-                constant_(self.q_linear.bias, 0.)
-            constant_(self.out_proj.bias, 0.)
+                constant_(self.q_linear.bias, 0.0)
+            constant_(self.out_proj.bias, 0.0)
 
     def forward(self, q, k, v, mask, zero_pad):
-
         bs = q.size(0)
 
         # perform linear operation and split into h heads
@@ -360,12 +400,10 @@ class MultiHeadAttention(nn.Module):
         q = q.transpose(1, 2)
         v = v.transpose(1, 2)
         # calculate attention using function we will define next
-        scores = attention(q, k, v, self.d_k,
-                           mask, self.dropout, zero_pad)
+        scores = attention(q, k, v, self.d_k, mask, self.dropout, zero_pad)
 
         # concatenate heads and put through final linear layer
-        concat = scores.transpose(1, 2).contiguous()\
-            .view(bs, -1, self.d_model)
+        concat = scores.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
 
         output = self.out_proj(concat)
 
@@ -377,8 +415,9 @@ def attention(q, k, v, d_k, mask, dropout, zero_pad):
     This is called by Multi-head atention object to find the values.
     """
     # d_k: 每一个头的dim
-    scores = torch.matmul(q, k.transpose(-2, -1)) / \
-        math.sqrt(d_k)  # BS, 8, seqlen, seqlen
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(
+        d_k
+    )  # BS, 8, seqlen, seqlen
     bs, head, seqlen = scores.size(0), scores.size(1), scores.size(2)
 
     scores.masked_fill_(mask == 0, -1e32)
@@ -387,7 +426,7 @@ def attention(q, k, v, d_k, mask, dropout, zero_pad):
     # print(zero_pad)
     if zero_pad:
         pad_zero = torch.zeros(bs, head, 1, seqlen).to(device)
-        scores = torch.cat([pad_zero, scores[:, :, 1:, :]], dim=2) # 第一行score置0
+        scores = torch.cat([pad_zero, scores[:, :, 1:, :]], dim=2)  # 第一行score置0
     # print(f"after zero pad scores: {scores}")
     scores = dropout(scores)
     output = torch.matmul(scores, v)
@@ -405,7 +444,7 @@ class LearnablePositionalEmbedding(nn.Module):
         self.weight = nn.Parameter(pe, requires_grad=True)
 
     def forward(self, x):
-        return self.weight[:, :x.size(Dim.seq), :]  # ( 1,seq,  Feature)
+        return self.weight[:, : x.size(Dim.seq), :]  # ( 1,seq,  Feature)
 
 
 class CosinePositionalEmbedding(nn.Module):
@@ -414,12 +453,13 @@ class CosinePositionalEmbedding(nn.Module):
         # Compute the positional encodings once in log space.
         pe = 0.1 * torch.randn(max_len, d_model)
         position = torch.arange(0, max_len).unsqueeze(1).long()
-        div_term = torch.exp(torch.arange(0, d_model, 2).long() *
-                             -(math.log(10000.0) / d_model))
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).long() * -(math.log(10000.0) / d_model)
+        )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)
         self.weight = nn.Parameter(pe, requires_grad=False)
 
     def forward(self, x):
-        return self.weight[:, :x.size(Dim.seq), :]  # ( 1,seq,  Feature)
+        return self.weight[:, : x.size(Dim.seq), :]  # ( 1,seq,  Feature)
